@@ -2,21 +2,20 @@
 import os
 import sys
 import logging
-import traceback
 import asyncio
-import json
+import aiosqlite
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-import aiosqlite
+import json
+from pathlib import Path
 
 from telegram import (
     Update, 
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    InputMediaVideo,
     BotCommand,
-    ChatMember
+    ChatMember,
+    LabeledPrice
 )
 from telegram.ext import (
     Application, 
@@ -24,17 +23,19 @@ from telegram.ext import (
     MessageHandler, 
     filters, 
     ContextTypes,
-    ApplicationBuilder,
     CallbackQueryHandler,
-    ConversationHandler
+    ConversationHandler,
+    PreCheckoutQueryHandler
 )
+from telegram.request import HTTPXRequest
 
-# ========== КОНСТАНТЫ И КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8569312600:AAGiuvWLi2n84SYahF_pyye94xFqKgNl2IU"
-ADMIN_ID = 6646433980
-
-# Состояния для ConversationHandler
-SELECT_CHANNEL, SELECT_CONTENT, SELECT_TIME, CONFIRM_POST = range(4)
+# ========== КОНФИГУРАЦИЯ ==========
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7370973281:AAGdnM2SdekWwSF5alb5vnt0UWAN5QZ1dCQ")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "6646433980"))
+PORT = int(os.environ.get("PORT", 8443))
+WEBHOOK_URL = os.environ.get("RAILWAY_STATIC_URL", "")
+if WEBHOOK_URL:
+    WEBHOOK_URL = f"https://{WEBHOOK_URL}/webhook"
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -43,239 +44,224 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== КЛАСС БАЗЫ ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ ==========
 class Database:
     def __init__(self, db_path: str = "scheduler.db"):
         self.db_path = db_path
+        self.connection = None
         
+    async def connect(self):
+        """Устанавливаем соединение с базой данных"""
+        if self.connection is None:
+            self.connection = await aiosqlite.connect(self.db_path)
+            self.connection.row_factory = aiosqlite.Row
+        return self.connection
+    
     async def init_db(self):
         """Инициализация базы данных"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Пользователи
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    last_name TEXT,
-                    tariff TEXT DEFAULT 'free',
-                    subscription_end DATETIME,
-                    channels_count INTEGER DEFAULT 0,
-                    posts_today INTEGER DEFAULT 0,
-                    last_post_date DATE,
-                    registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Каналы пользователей
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS user_channels (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    channel_id TEXT UNIQUE,
-                    channel_name TEXT,
-                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            # Запланированные посты
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS scheduled_posts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    channel_id TEXT,
-                    content_type TEXT,
-                    content TEXT,
-                    media_id TEXT,
-                    scheduled_time DATETIME,
-                    status TEXT DEFAULT 'pending',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            # Платежи
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS payments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    tariff TEXT,
-                    amount INTEGER,
-                    status TEXT DEFAULT 'pending',
-                    payment_date DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (user_id)
-                )
-            ''')
-            
-            # Настройки тарифов
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS tariff_settings (
-                    tariff_name TEXT PRIMARY KEY,
-                    price INTEGER,
-                    channels_limit INTEGER,
-                    posts_per_day INTEGER,
-                    duration_days INTEGER,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Приватные каналы для тарифов
-            await db.execute('''
-                CREATE TABLE IF NOT EXISTS private_channels (
-                    tariff_name TEXT PRIMARY KEY,
-                    channel_id TEXT UNIQUE,
-                    invite_link TEXT,
-                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            # Инициализируем тарифы по умолчанию
-            default_tariffs = [
-                ('basic', 299, 2, 5, 30),
-                ('premium', 599, 5, 20, 30),
-                ('vip', 999, 10, 50, 30)
-            ]
-            
-            for tariff in default_tariffs:
-                await db.execute('''
-                    INSERT OR IGNORE INTO tariff_settings 
-                    (tariff_name, price, channels_limit, posts_per_day, duration_days)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', tariff)
-            
-            await db.commit()
-            logger.info("База данных инициализирована")
+        conn = await self.connect()
+        
+        # Пользователи
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                tariff TEXT DEFAULT 'free',
+                subscription_end DATETIME,
+                channels_count INTEGER DEFAULT 0,
+                posts_today INTEGER DEFAULT 0,
+                last_post_date DATE,
+                registered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Каналы пользователей
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                channel_id TEXT,
+                channel_name TEXT,
+                added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, channel_id)
+            )
+        ''')
+        
+        # Запланированные посты
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                channel_id TEXT,
+                content_type TEXT,
+                content TEXT,
+                media_id TEXT,
+                scheduled_time DATETIME,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Платежи
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                tariff TEXT,
+                amount INTEGER,
+                status TEXT DEFAULT 'pending',
+                payment_date DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Настройки тарифов
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS tariff_settings (
+                tariff_name TEXT PRIMARY KEY,
+                price INTEGER,
+                channels_limit INTEGER,
+                posts_per_day INTEGER,
+                duration_days INTEGER
+            )
+        ''')
+        
+        # Приватные каналы
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS private_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tariff_name TEXT,
+                channel_id TEXT,
+                invite_link TEXT,
+                UNIQUE(tariff_name)
+            )
+        ''')
+        
+        # Инициализируем базовый тариф
+        await conn.execute('''
+            INSERT OR REPLACE INTO tariff_settings 
+            (tariff_name, price, channels_limit, posts_per_day, duration_days)
+            VALUES ('basic', 100, 2, 5, 30)
+        ''')
+        
+        await conn.commit()
+        logger.info("База данных инициализирована")
+    
+    async def close(self):
+        """Закрываем соединение"""
+        if self.connection:
+            await self.connection.close()
     
     # ========== ПОЛЬЗОВАТЕЛИ ==========
     async def add_user(self, user_id: int, username: str, first_name: str, last_name: str = ""):
-        """Добавление нового пользователя"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, username, first_name, last_name))
-            await db.commit()
+        """Добавление пользователя"""
+        conn = await self.connect()
+        await conn.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
+            VALUES (?, ?, ?, ?)
+        ''', (user_id, username, first_name, last_name))
+        await conn.commit()
     
     async def get_user(self, user_id: int) -> Optional[Dict]:
         """Получение информации о пользователе"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+        conn = await self.connect()
+        async with conn.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
     
-    async def update_user_tariff(self, user_id: int, tariff: str):
+    async def update_user_tariff(self, user_id: int, tariff: str, duration_days: int = 30):
         """Обновление тарифа пользователя"""
-        tariff_info = await self.get_tariff_info(tariff)
-        if not tariff_info:
-            return False
+        subscription_end = datetime.now() + timedelta(days=duration_days)
+        conn = await self.connect()
+        await conn.execute('''
+            UPDATE users 
+            SET tariff = ?, subscription_end = ?
+            WHERE user_id = ?
+        ''', (tariff, subscription_end.isoformat(), user_id))
+        await conn.commit()
+    
+    # ========== КАНАЛЫ ==========
+    async def add_user_channel(self, user_id: int, channel_id: str, channel_name: str) -> Tuple[bool, str]:
+        """Добавление канала пользователя"""
+        conn = await self.connect()
         
-        subscription_end = datetime.now() + timedelta(days=tariff_info['duration_days'])
+        # Проверяем лимит каналов
+        user = await self.get_user(user_id)
+        tariff = await self.get_tariff_info(user['tariff'])
         
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                UPDATE users 
-                SET tariff = ?, subscription_end = ?
-                WHERE user_id = ?
-            ''', (tariff, subscription_end.isoformat(), user_id))
-            await db.commit()
-            return True
+        async with conn.execute('SELECT COUNT(*) FROM user_channels WHERE user_id = ?', (user_id,)) as cursor:
+            count = (await cursor.fetchone())[0]
+            
+        if count >= tariff['channels_limit']:
+            return False, f"Лимит каналов ({tariff['channels_limit']}) достигнут"
+        
+        try:
+            await conn.execute('''
+                INSERT INTO user_channels (user_id, channel_id, channel_name)
+                VALUES (?, ?, ?)
+            ''', (user_id, channel_id, channel_name))
+            await conn.commit()
+            return True, "Канал успешно добавлен"
+        except aiosqlite.IntegrityError:
+            return False, "Этот канал уже добавлен"
     
     async def get_user_channels(self, user_id: int) -> List[Dict]:
         """Получение каналов пользователя"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                'SELECT * FROM user_channels WHERE user_id = ? ORDER BY added_at DESC',
-                (user_id,)
-            )
+        conn = await self.connect()
+        async with conn.execute(
+            'SELECT * FROM user_channels WHERE user_id = ? ORDER BY added_at DESC', 
+            (user_id,)
+        ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
-    
-    async def add_user_channel(self, user_id: int, channel_id: str, channel_name: str) -> Tuple[bool, str]:
-        """Добавление канала пользователя"""
-        # Проверяем лимит каналов
-        user = await self.get_user(user_id)
-        if not user:
-            return False, "Пользователь не найден"
-        
-        tariff_info = await self.get_tariff_info(user['tariff'])
-        if not tariff_info:
-            return False, "Тариф не найден"
-        
-        current_channels = await self.get_user_channels(user_id)
-        if len(current_channels) >= tariff_info['channels_limit']:
-            return False, f"Лимит каналов ({tariff_info['channels_limit']}) достигнут"
-        
-        async with aiosqlite.connect(self.db_path) as db:
-            try:
-                await db.execute('''
-                    INSERT INTO user_channels (user_id, channel_id, channel_name)
-                    VALUES (?, ?, ?)
-                ''', (user_id, channel_id, channel_name))
-                
-                await db.execute('''
-                    UPDATE users SET channels_count = channels_count + 1 
-                    WHERE user_id = ?
-                ''', (user_id,))
-                
-                await db.commit()
-                return True, "Канал успешно добавлен"
-            except aiosqlite.IntegrityError:
-                return False, "Этот канал уже добавлен"
     
     # ========== ТАРИФЫ ==========
-    async def get_tariff_info(self, tariff_name: str) -> Optional[Dict]:
+    async def get_tariff_info(self, tariff_name: str) -> Dict:
         """Получение информации о тарифе"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                'SELECT * FROM tariff_settings WHERE tariff_name = ?',
-                (tariff_name,)
-            )
+        conn = await self.connect()
+        async with conn.execute(
+            'SELECT * FROM tariff_settings WHERE tariff_name = ?', 
+            (tariff_name,)
+        ) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
-    
-    async def get_all_tariffs(self) -> List[Dict]:
-        """Получение всех тарифов"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('SELECT * FROM tariff_settings ORDER BY price')
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            if row:
+                return dict(row)
+            # Возвращаем тариф free по умолчанию
+            return {
+                'tariff_name': 'free',
+                'price': 0,
+                'channels_limit': 1,
+                'posts_per_day': 1,
+                'duration_days': 0
+            }
     
     async def update_tariff_price(self, tariff_name: str, price: int) -> bool:
         """Обновление цены тарифа"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                UPDATE tariff_settings SET price = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE tariff_name = ?
-            ''', (price, tariff_name))
-            await db.commit()
-            return cursor.rowcount > 0
+        conn = await self.connect()
+        cursor = await conn.execute(
+            'UPDATE tariff_settings SET price = ? WHERE tariff_name = ?',
+            (price, tariff_name)
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
     
-    async def add_private_channel(self, tariff_name: str, channel_id: str, invite_link: str) -> bool:
-        """Добавление приватного канала для тарифа"""
-        async with aiosqlite.connect(self.db_path) as db:
-            try:
-                await db.execute('''
-                    INSERT OR REPLACE INTO private_channels (tariff_name, channel_id, invite_link)
-                    VALUES (?, ?, ?)
-                ''', (tariff_name, channel_id, invite_link))
-                await db.commit()
-                return True
-            except:
-                return False
+    async def set_private_channel(self, tariff_name: str, channel_id: str, invite_link: str):
+        """Настройка приватного канала"""
+        conn = await self.connect()
+        await conn.execute('''
+            INSERT OR REPLACE INTO private_channels (tariff_name, channel_id, invite_link)
+            VALUES (?, ?, ?)
+        ''', (tariff_name, channel_id, invite_link))
+        await conn.commit()
     
     async def get_private_channel(self, tariff_name: str) -> Optional[Dict]:
-        """Получение приватного канала для тарифа"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                'SELECT * FROM private_channels WHERE tariff_name = ?',
-                (tariff_name,)
-            )
+        """Получение приватного канала"""
+        conn = await self.connect()
+        async with conn.execute(
+            'SELECT * FROM private_channels WHERE tariff_name = ?',
+            (tariff_name,)
+        ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
     
@@ -283,425 +269,319 @@ class Database:
     async def add_scheduled_post(self, user_id: int, channel_id: str, content_type: str,
                                 content: str, media_id: str, scheduled_time: datetime) -> int:
         """Добавление запланированного поста"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                INSERT INTO scheduled_posts 
-                (user_id, channel_id, content_type, content, media_id, scheduled_time)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (user_id, channel_id, content_type, content, media_id, scheduled_time.isoformat()))
-            await db.commit()
-            return cursor.lastrowid
+        conn = await self.connect()
+        cursor = await conn.execute('''
+            INSERT INTO scheduled_posts 
+            (user_id, channel_id, content_type, content, media_id, scheduled_time)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, channel_id, content_type, content, media_id, scheduled_time.isoformat()))
+        await conn.commit()
+        return cursor.lastrowid
     
-    async def get_pending_posts(self, limit: int = 100) -> List[Dict]:
+    async def get_pending_posts(self) -> List[Dict]:
         """Получение ожидающих публикаций"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('''
-                SELECT * FROM scheduled_posts 
-                WHERE status = 'pending' AND scheduled_time <= datetime('now', '+1 hour')
-                ORDER BY scheduled_time
-                LIMIT ?
-            ''', (limit,))
+        conn = await self.connect()
+        async with conn.execute('''
+            SELECT * FROM scheduled_posts 
+            WHERE status = 'pending' AND scheduled_time <= datetime('now', '+5 minutes')
+            ORDER BY scheduled_time
+        ''') as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
     
     async def update_post_status(self, post_id: int, status: str):
         """Обновление статуса поста"""
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                UPDATE scheduled_posts SET status = ? WHERE id = ?
-            ''', (status, post_id))
-            await db.commit()
-    
-    async def get_user_posts(self, user_id: int, limit: int = 50) -> List[Dict]:
-        """Получение постов пользователя"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('''
-                SELECT * FROM scheduled_posts 
-                WHERE user_id = ?
-                ORDER BY scheduled_time DESC
-                LIMIT ?
-            ''', (user_id, limit))
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
-    
-    async def check_post_limit(self, user_id: int) -> Tuple[bool, str]:
-        """Проверка лимита постов на сегодня"""
-        user = await self.get_user(user_id)
-        if not user:
-            return False, "Пользователь не найден"
-        
-        tariff_info = await self.get_tariff_info(user['tariff'])
-        if not tariff_info:
-            return False, "Тариф не найден"
-        
-        today = datetime.now().date()
-        last_post_date = user.get('last_post_date')
-        
-        if last_post_date:
-            last_post_date = datetime.fromisoformat(last_post_date).date() if isinstance(last_post_date, str) else last_post_date
-            if last_post_date == today:
-                if user['posts_today'] >= tariff_info['posts_per_day']:
-                    return False, f"Лимит постов на сегодня ({tariff_info['posts_per_day']}) достигнут"
-        
-        return True, ""
-    
-    async def increment_post_count(self, user_id: int):
-        """Увеличение счетчика постов"""
-        today = datetime.now().date().isoformat()
-        
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute('''
-                UPDATE users 
-                SET posts_today = CASE 
-                    WHEN last_post_date = date(?) THEN posts_today + 1 
-                    ELSE 1 
-                END,
-                last_post_date = date(?)
-                WHERE user_id = ?
-            ''', (today, today, user_id))
-            await db.commit()
+        conn = await self.connect()
+        await conn.execute(
+            'UPDATE scheduled_posts SET status = ? WHERE id = ?',
+            (status, post_id)
+        )
+        await conn.commit()
     
     # ========== ПЛАТЕЖИ И СТАТИСТИКА ==========
-    async def add_payment(self, user_id: int, tariff: str, amount: int, status: str = 'completed') -> int:
+    async def add_payment(self, user_id: int, tariff: str, amount: int):
         """Добавление платежа"""
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute('''
-                INSERT INTO payments (user_id, tariff, amount, status)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, tariff, amount, status))
-            await db.commit()
-            return cursor.lastrowid
+        conn = await self.connect()
+        await conn.execute('''
+            INSERT INTO payments (user_id, tariff, amount, status)
+            VALUES (?, ?, ?, 'completed')
+        ''', (user_id, tariff, amount))
+        await conn.commit()
     
     async def get_statistics(self) -> Dict:
         """Получение статистики"""
-        async with aiosqlite.connect(self.db_path) as db:
-            # Общее количество пользователей
-            cursor = await db.execute('SELECT COUNT(*) FROM users')
+        conn = await self.connect()
+        
+        async with conn.execute('SELECT COUNT(*) FROM users') as cursor:
             total_users = (await cursor.fetchone())[0]
-            
-            # Пользователи по тарифам
-            cursor = await db.execute('''
-                SELECT tariff, COUNT(*) as count FROM users GROUP BY tariff
-            ''')
-            tariff_stats = {row[0]: row[1] for row in await cursor.fetchall()}
-            
-            # Общая прибыль
-            cursor = await db.execute('''
-                SELECT SUM(amount) FROM payments WHERE status = 'completed'
-            ''')
+        
+        async with conn.execute('SELECT SUM(amount) FROM payments WHERE status = "completed"') as cursor:
             total_revenue = (await cursor.fetchone())[0] or 0
-            
-            # Запланированные публикации
-            cursor = await db.execute('''
-                SELECT COUNT(*) FROM scheduled_posts WHERE status = 'pending'
-            ''')
-            pending_posts = (await cursor.fetchone())[0]
-            
-            return {
-                'total_users': total_users,
-                'tariff_stats': tariff_stats,
-                'total_revenue': total_revenue,
-                'pending_posts': pending_posts
-            }
+        
+        async with conn.execute('SELECT tariff, COUNT(*) FROM users GROUP BY tariff') as cursor:
+            tariff_stats = {row[0]: row[1] for row in await cursor.fetchall()}
+        
+        return {
+            'total_users': total_users,
+            'total_revenue': total_revenue,
+            'tariff_stats': tariff_stats
+        }
     
-    async def get_all_users(self, limit: int = 1000) -> List[Dict]:
+    async def get_all_users(self) -> List[Dict]:
         """Получение всех пользователей"""
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('''
-                SELECT * FROM users ORDER BY registered_at DESC LIMIT ?
-            ''', (limit,))
+        conn = await self.connect()
+        async with conn.execute('SELECT * FROM users ORDER BY registered_at DESC') as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
-    
-    async def export_users_csv(self) -> str:
-        """Экспорт пользователей в CSV"""
-        users = await self.get_all_users()
-        
-        csv_lines = ["ID,Username,First Name,Last Name,Tariff,Channels,Posts Today,Registered"]
-        for user in users:
-            csv_lines.append(
-                f"{user['user_id']},"
-                f"{user['username'] or ''},"
-                f"{user['first_name']},"
-                f"{user['last_name'] or ''},"
-                f"{user['tariff']},"
-                f"{user['channels_count']},"
-                f"{user['posts_today']},"
-                f"{user['registered_at']}"
-            )
-        
-        return "\n".join(csv_lines)
 
 # Инициализируем базу данных
 db = Database()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-async def is_user_admin(chat_id: str, user_id: int, bot) -> bool:
-    """Проверяет, является ли пользователь администратором канала"""
+def create_keyboard(buttons: List[List[Dict]]) -> InlineKeyboardMarkup:
+    """Создание клавиатуры"""
+    keyboard = []
+    for row in buttons:
+        keyboard.append([
+            InlineKeyboardButton(btn['text'], callback_data=btn['callback'])
+            for btn in row
+        ])
+    return InlineKeyboardMarkup(keyboard)
+
+async def check_user_admin(bot, chat_id: str, user_id: int) -> bool:
+    """Проверка, является ли пользователь администратором канала"""
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         return member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
-    except:
-        return False
-
-async def check_subscription(user_id: int, bot) -> bool:
-    """Проверяет подписку на приватный канал"""
-    user = await db.get_user(user_id)
-    if not user or user['tariff'] == 'free':
-        return False
-    
-    private_channel = await db.get_private_channel(user['tariff'])
-    if not private_channel:
-        return True  # Если канал не настроен, пропускаем проверку
-    
-    try:
-        member = await bot.get_chat_member(private_channel['channel_id'], user_id)
-        return member.status not in [ChatMember.LEFT, ChatMember.KICKED, ChatMember.BANNED]
-    except:
+    except Exception as e:
+        logger.error(f"Ошибка проверки администратора: {e}")
         return False
 
 # ========== ОСНОВНЫЕ КОМАНДЫ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка команды /start"""
+    """Команда /start"""
     user = update.effective_user
     await db.add_user(user.id, user.username, user.first_name, user.last_name)
     
-    welcome_text = f"""
-👋 Привет, {user.first_name}!
+    keyboard = create_keyboard([
+        [{'text': '📅 Запланировать пост', 'callback': 'plan_post'}],
+        [{'text': '📊 Мои каналы', 'callback': 'my_channels'}],
+        [{'text': '💰 Тарифы', 'callback': 'tariffs'}],
+        [{'text': '🆘 Помощь', 'callback': 'help'}]
+    ])
+    
+    await update.message.reply_text(
+        f"👋 Привет, {user.first_name}!\n\n"
+        "🤖 Я бот для автоматической публикации контента в Telegram-каналах.\n\n"
+        "📋 **Возможности:**\n"
+        "• Планирование публикаций\n"
+        "• Поддержка фото/видео/текста\n"
+        "• Один платный тариф с особыми возможностями\n\n"
+        "✨ **Для начала работы:**\n"
+        "1. Добавьте канал (/add_channel)\n"
+        "2. Выберите тариф (/tariffs)\n"
+        "3. Планируйте посты!",
+        reply_markup=keyboard
+    )
 
-🤖 Я бот для автоматической публикации контента в телеграм-каналах.
-
-📋 **Основные возможности:**
-• Планирование публикаций в каналах
-• Поддержка фото, видео и текста
-• Несколько тарифов с разными возможностями
-• Автоматическая публикация по расписанию
-
-✨ **Команды:**
-/plan - Запланировать публикацию
-/channels - Мои каналы
-/tariffs - Тарифы и цены
-/help - Помощь
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("📅 Запланировать пост", callback_data="plan_post")],
-        [InlineKeyboardButton("📊 Мои каналы", callback_data="my_channels")],
-        [InlineKeyboardButton("💰 Тарифы", callback_data="tariffs")],
-        [InlineKeyboardButton("🆘 Помощь", callback_data="help")]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(welcome_text, reply_markup=reply_markup)
-
-async def tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает доступные тарифы"""
-    tariffs_data = await db.get_all_tariffs()
-    
-    text = "💰 **Доступные тарифы:**\n\n"
-    
-    for tariff in tariffs_data:
-        price = tariff['price']
-        text += f"✨ **{tariff['tariff_name'].upper()}**\n"
-        text += f"💵 {price} звезд\n"
-        text += f"📊 Каналов: {tariff['channels_limit']}\n"
-        text += f"📅 Постов/день: {tariff['posts_per_day']}\n"
-        text += f"⏳ Дней: {tariff['duration_days']}\n\n"
-    
-    text += "⚠️ Для оплаты используйте команду /pay [тариф]\n"
-    text += "Пример: /pay basic"
-    
-    keyboard = [
-        [InlineKeyboardButton("💳 Купить BASIC", callback_data="buy_basic")],
-        [InlineKeyboardButton("💎 Купить PREMIUM", callback_data="buy_premium")],
-        [InlineKeyboardButton("👑 Купить VIP", callback_data="buy_vip")]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(text, reply_markup=reply_markup)
-
-async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка оплаты тарифа"""
-    if not context.args:
-        await update.message.reply_text("❌ Укажите тариф: /pay [basic/premium/vip]")
-        return
-    
-    tariff_name = context.args[0].lower()
-    tariff_info = await db.get_tariff_info(tariff_name)
-    
-    if not tariff_info:
-        await update.message.reply_text("❌ Тариф не найден. Доступные: basic, premium, vip")
-        return
-    
-    private_channel = await db.get_private_channel(tariff_name)
-    
-    if not private_channel:
-        # Если канал не настроен, просто активируем тариф
-        await db.update_user_tariff(update.effective_user.id, tariff_name)
-        await db.add_payment(update.effective_user.id, tariff_name, tariff_info['price'])
-        
-        await update.message.reply_text(
-            f"✅ Тариф {tariff_name.upper()} активирован!\n"
-            f"Срок действия: {tariff_info['duration_days']} дней\n"
-            f"Лимит каналов: {tariff_info['channels_limit']}\n"
-            f"Постов в день: {tariff_info['posts_per_day']}"
-        )
-        return
+async def tariffs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /tariffs"""
+    tariff = await db.get_tariff_info('basic')
+    private_channel = await db.get_private_channel('basic')
     
     text = f"""
-💰 **Оплата тарифа {tariff_name.upper()}**
+💰 **Базовый тариф**
 
-💵 Стоимость: {tariff_info['price']} звезд
+💵 Цена: {tariff['price']} звезд
+📊 Каналов: {tariff['channels_limit']}
+📅 Постов в день: {tariff['posts_per_day']}
+⏳ Срок: {tariff['duration_days']} дней
 
-📋 Условия:
-• Каналов: {tariff_info['channels_limit']}
-• Постов в день: {tariff_info['posts_per_day']}
-• Дней: {tariff_info['duration_days']}
+"""
+    
+    if private_channel:
+        text += f"🔗 Приватный канал: {private_channel['invite_link']}\n\n"
+    
+    text += "💳 **Для покупки:**\nНажмите кнопку ниже или отправьте /buy"
+    
+    keyboard = create_keyboard([
+        [{'text': '💳 Купить тариф', 'callback': 'buy_tariff'}],
+        [{'text': '🔙 Назад', 'callback': 'main_menu'}]
+    ])
+    
+    await update.message.reply_text(text, reply_markup=keyboard)
 
-Для оплаты:
-1. Перейдите по ссылке: {private_channel['invite_link']}
-2. Подпишитесь на канал
-3. Отправьте {tariff_info['price']} звезд в этот чат
-4. Бот проверит подписку и активирует тариф
+async def buy_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Покупка тарифа"""
+    query = update.callback_query
+    await query.answer()
+    
+    tariff = await db.get_tariff_info('basic')
+    private_channel = await db.get_private_channel('basic')
+    
+    if private_channel:
+        text = f"""
+💳 **Оплата тарифа**
+
+💵 Стоимость: {tariff['price']} звезд
+
+📋 **Условия:**
+• Каналов: {tariff['channels_limit']}
+• Постов в день: {tariff['posts_per_day']}
+• Срок: {tariff['duration_days']} дней
+
+🔗 **Для активации:**
+1. Подпишитесь на канал: {private_channel['invite_link']}
+2. Отправьте {tariff['price']} звезд в этот чат
+3. Я проверю подписку и активирую тариф
 
 ⚠️ Если не подпишетесь в течение 2 часов, доступ будет отозван.
-    """
-    
-    await update.message.reply_text(text)
+"""
+    else:
+        text = f"""
+💳 **Оплата тарифа**
 
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление канала"""
-    if not context.args:
-        await update.message.reply_text(
-            "❌ Укажите ID канала и название\n"
-            "Пример: /add_channel -1001234567890 Название канала"
-        )
-        return
+💵 Стоимость: {tariff['price']} звезд
+📋 Условия: как в бесплатном тарифе
+
+⚠️ Администратор еще не настроил приватный канал.
+Свяжитесь с администратором для активации тарифа.
+"""
     
-    if len(context.args) < 2:
-        await update.message.reply_text("❌ Укажите и ID канала и название")
+    keyboard = create_keyboard([
+        [{'text': '✅ Я подписался, оплатить', 'callback': 'confirm_payment'}],
+        [{'text': '🔙 Назад', 'callback': 'tariffs'}]
+    ])
+    
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /add_channel"""
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Использование: /add_channel [ID_канала] [Название]\n\n"
+            "Пример: /add_channel -1001234567890 Мой Канал\n\n"
+            "📝 **Как получить ID канала?**\n"
+            "1. Добавьте бота @getidsbot в канал\n"
+            "2. Напишите любое сообщение\n"
+            "3. Бот покажет ID канала"
+        )
         return
     
     channel_id = context.args[0]
     channel_name = " ".join(context.args[1:])
     
     # Проверяем, что бот админ в канале
-    if not await is_user_admin(channel_id, context.bot.id, context.bot):
+    if not await check_user_admin(context.bot, channel_id, context.bot.id):
         await update.message.reply_text(
-            "❌ Бот не является администратором этого канала.\n"
-            "Добавьте бота как администратора с правом публикации постов."
+            "❌ Я не являюсь администратором этого канала!\n\n"
+            "📌 **Добавьте меня как администратора с правами:**\n"
+            "• Публикация сообщений\n"
+            "• Редактирование сообщений"
         )
         return
     
     success, message = await db.add_user_channel(update.effective_user.id, channel_id, channel_name)
     
     if success:
-        await update.message.reply_text(f"✅ {message}")
+        await update.message.reply_text(
+            f"✅ {message}\n\n"
+            f"📝 Канал: {channel_name}\n"
+            f"🔗 ID: {channel_id}"
+        )
     else:
         await update.message.reply_text(f"❌ {message}")
 
-async def my_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает каналы пользователя"""
+async def my_channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /channels"""
     user_id = update.effective_user.id
     channels = await db.get_user_channels(user_id)
     user = await db.get_user(user_id)
     
     if not channels:
-        await update.message.reply_text("📭 У вас нет добавленных каналов.\nИспользуйте /add_channel")
+        await update.message.reply_text(
+            "📭 У вас нет добавленных каналов.\n\n"
+            "✨ **Добавить канал:**\n"
+            "/add_channel [ID] [Название]"
+        )
         return
     
     text = f"📊 **Ваши каналы** (тариф: {user['tariff']})\n\n"
-    
     for i, channel in enumerate(channels, 1):
         text += f"{i}. {channel['channel_name']}\n"
-        text += f"   ID: {channel['channel_id']}\n"
-        text += f"   Добавлен: {channel['added_at'][:10]}\n\n"
+        text += f"   ID: {channel['channel_id']}\n\n"
     
     await update.message.reply_text(text)
 
 # ========== ПЛАНИРОВАНИЕ ПОСТОВ ==========
-async def plan_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def plan_post_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало планирования поста"""
+    query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
+    user = await db.get_user(user_id)
     
-    # Проверяем лимит постов
-    can_post, message = await db.check_post_limit(user_id)
-    if not can_post:
-        await update.message.reply_text(f"❌ {message}")
-        return
-    
-    # Проверяем подписку
-    if not await check_subscription(user_id, context.bot):
-        await update.message.reply_text(
-            "❌ Ваша подписка не активна или истекла.\n"
-            "Проверьте подписку на приватный канал или обновите тариф."
-        )
-        return
+    # Проверяем тариф
+    if user['tariff'] == 'free':
+        tariff = await db.get_tariff_info('free')
+        posts_today = user['posts_today']
+        
+        if posts_today >= tariff['posts_per_day']:
+            await query.edit_message_text(
+                "❌ Лимит бесплатных постов на сегодня исчерпан!\n\n"
+                "💳 **Купите тариф для увеличения лимита:**\n"
+                "/tariffs - посмотреть тарифы"
+            )
+            return
     
     # Получаем каналы пользователя
     channels = await db.get_user_channels(user_id)
     if not channels:
-        await update.message.reply_text(
-            "❌ У вас нет добавленных каналов.\n"
-            "Сначала добавьте канал: /add_channel"
+        await query.edit_message_text(
+            "❌ У вас нет добавленных каналов!\n\n"
+            "✨ **Добавьте канал:**\n"
+            "/add_channel [ID] [Название]"
         )
-        return ConversationHandler.END
+        return
     
     # Создаем клавиатуру с каналами
-    keyboard = []
+    keyboard_buttons = []
     for channel in channels:
-        keyboard.append([InlineKeyboardButton(
-            channel['channel_name'], 
-            callback_data=f"select_channel_{channel['channel_id']}"
-        )])
+        keyboard_buttons.append([
+            {'text': f"📢 {channel['channel_name']}", 'callback': f"select_channel_{channel['channel_id']}"}
+        ])
+    keyboard_buttons.append([{'text': '🔙 Назад', 'callback': 'main_menu'}])
     
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+    keyboard = create_keyboard(keyboard_buttons)
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(
+    await query.edit_message_text(
         "📋 **Выберите канал для публикации:**",
-        reply_markup=reply_markup
+        reply_markup=keyboard
     )
-    
-    return SELECT_CHANNEL
 
-async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора канала"""
+async def select_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор канала"""
     query = update.callback_query
     await query.answer()
     
-    if query.data.startswith("select_channel_"):
-        channel_id = query.data.split("_")[2]
-        context.user_data['channel_id'] = channel_id
-        
-        await query.edit_message_text(
-            "📝 **Отправьте текст поста**\n\n"
-            "Вы можете отправить:\n"
-            "• Только текст\n"
-            "• Текст + фото\n"
-            "• Текст + видео\n\n"
-            "Или отправьте ❌ для отмены."
-        )
-        
-        return SELECT_CONTENT
+    channel_id = query.data.split('_')[2]
+    context.user_data['channel_id'] = channel_id
     
-    elif query.data == "cancel":
-        await query.edit_message_text("❌ Планирование отменено.")
-        return ConversationHandler.END
+    await query.edit_message_text(
+        "📝 **Отправьте текст поста**\n\n"
+        "Можно отправить:\n"
+        "• Текст\n"
+        "• Текст + фото\n"
+        "• Текст + видео\n\n"
+        "Или нажмите ❌ для отмены."
+    )
 
-async def select_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_post_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка контента поста"""
-    user_id = update.effective_user.id
-    
-    if update.message.text and update.message.text == "❌":
+    if update.message.text == '❌':
         await update.message.reply_text("❌ Планирование отменено.")
-        return ConversationHandler.END
+        return
     
     context.user_data['text'] = update.message.text or ""
     context.user_data['media_id'] = None
@@ -714,528 +594,526 @@ async def select_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['media_id'] = update.message.video.file_id
         context.user_data['content_type'] = 'video'
     
-    keyboard = [
+    keyboard = create_keyboard([
         [
-            InlineKeyboardButton("⏰ Через 1 час", callback_data="time_1h"),
-            InlineKeyboardButton("⏱️ Через 3 часа", callback_data="time_3h"),
+            {'text': '⏰ Через 1 час', 'callback': 'time_1h'},
+            {'text': '⏱️ Через 3 часа', 'callback': 'time_3h'}
         ],
         [
-            InlineKeyboardButton("🌅 Завтра утром", callback_data="time_tomorrow_morning"),
-            InlineKeyboardButton("🌆 Завтра вечером", callback_data="time_tomorrow_evening"),
+            {'text': '🌅 Завтра утром', 'callback': 'time_tomorrow_9'},
+            {'text': '🌆 Завтра вечером', 'callback': 'time_tomorrow_18'}
         ],
         [
-            InlineKeyboardButton("📅 Выбрать дату", callback_data="time_custom"),
-            InlineKeyboardButton("⚡ Сейчас", callback_data="time_now"),
+            {'text': '📅 Выбрать дату', 'callback': 'time_custom'},
+            {'text': '⚡ Сейчас', 'callback': 'time_now'}
         ],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")]
-    ]
+        [{'text': '❌ Отмена', 'callback': 'cancel'}]
+    ])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    preview_text = context.user_data['text'][:100] + "..." if len(context.user_data['text']) > 100 else context.user_data['text']
-    media_type = "📷 Фото" if context.user_data['content_type'] == 'photo' else "🎥 Видео" if context.user_data['content_type'] == 'video' else "📝 Текст"
+    text_preview = context.user_data['text'][:100] + "..." if len(context.user_data['text']) > 100 else context.user_data['text']
     
     await update.message.reply_text(
-        f"✅ Контент получен!\n"
-        f"Тип: {media_type}\n"
-        f"Текст: {preview_text}\n\n"
+        f"✅ Контент получен!\n\n"
+        f"📝 Текст: {text_preview}\n"
+        f"📁 Тип: {context.user_data['content_type']}\n\n"
         f"⏰ **Выберите время публикации:**",
-        reply_markup=reply_markup
+        reply_markup=keyboard
     )
-    
-    return SELECT_TIME
 
-async def select_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка выбора времени"""
+async def select_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор времени публикации"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == "cancel":
-        await query.edit_message_text("❌ Планирование отменено.")
-        return ConversationHandler.END
-    
     now = datetime.now()
     
-    if query.data == "time_1h":
+    if query.data == 'time_1h':
         scheduled_time = now + timedelta(hours=1)
-    elif query.data == "time_3h":
+    elif query.data == 'time_3h':
         scheduled_time = now + timedelta(hours=3)
-    elif query.data == "time_tomorrow_morning":
-        scheduled_time = now.replace(hour=9, minute=0, second=0) + timedelta(days=1)
-    elif query.data == "time_tomorrow_evening":
-        scheduled_time = now.replace(hour=18, minute=0, second=0) + timedelta(days=1)
-    elif query.data == "time_now":
+    elif query.data == 'time_tomorrow_9':
+        scheduled_time = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0)
+    elif query.data == 'time_tomorrow_18':
+        scheduled_time = (now + timedelta(days=1)).replace(hour=18, minute=0, second=0)
+    elif query.data == 'time_now':
         scheduled_time = now + timedelta(minutes=5)
-    elif query.data == "time_custom":
+    elif query.data == 'time_custom':
         await query.edit_message_text(
             "📅 **Введите дату и время в формате:**\n"
-            "YYYY.MM.DD HH:MM\n\n"
+            "ГГГГ.ММ.ДД ЧЧ:ММ\n\n"
             "Пример: 2025.12.31 18:30\n\n"
             "Или отправьте ❌ для отмены."
         )
-        return SELECT_TIME
+        return
+    elif query.data == 'cancel':
+        await query.edit_message_text("❌ Планирование отменено.")
+        return
     
     context.user_data['scheduled_time'] = scheduled_time
     
     # Показываем подтверждение
-    channel_id = context.user_data['channel_id']
-    text = context.user_data['text']
-    media_type = context.user_data['content_type']
-    
-    confirm_text = f"""
-📋 **Подтверждение публикации:**
-
-📢 Канал: {channel_id}
-📝 Тип: {media_type}
-⏰ Время: {scheduled_time.strftime('%Y.%m.%d %H:%M')}
-
-Текст:
-{text[:200]}...
-
-✅ **Подтвердить публикацию?**
-    """
-    
-    keyboard = [
+    keyboard = create_keyboard([
         [
-            InlineKeyboardButton("✅ Да, опубликовать", callback_data="confirm_yes"),
-            InlineKeyboardButton("❌ Нет, отменить", callback_data="confirm_no")
+            {'text': '✅ Да, запланировать', 'callback': 'confirm_post'},
+            {'text': '❌ Нет, отменить', 'callback': 'cancel'}
         ]
-    ]
+    ])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(confirm_text, reply_markup=reply_markup)
-    
-    return CONFIRM_POST
+    await query.edit_message_text(
+        f"📋 **Подтверждение публикации**\n\n"
+        f"📢 Канал: {context.user_data['channel_id']}\n"
+        f"📝 Тип: {context.user_data['content_type']}\n"
+        f"⏰ Время: {scheduled_time.strftime('%Y.%m.%d %H:%M')}\n\n"
+        f"✅ **Подтвердить публикацию?**",
+        reply_markup=keyboard
+    )
 
-async def custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_custom_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка пользовательского времени"""
-    if update.message.text == "❌":
+    if update.message.text == '❌':
         await update.message.reply_text("❌ Планирование отменено.")
-        return ConversationHandler.END
+        return
     
     try:
-        date_str = update.message.text
-        scheduled_time = datetime.strptime(date_str, "%Y.%m.%d %H:%M")
+        scheduled_time = datetime.strptime(update.message.text, "%Y.%m.%d %H:%M")
         
         if scheduled_time < datetime.now():
             await update.message.reply_text("❌ Нельзя планировать в прошлом!")
-            return SELECT_TIME
+            return
         
         context.user_data['scheduled_time'] = scheduled_time
         
-        # Показываем подтверждение
-        channel_id = context.user_data['channel_id']
-        text = context.user_data['text']
-        media_type = context.user_data['content_type']
-        
-        confirm_text = f"""
-📋 **Подтверждение публикации:**
-
-📢 Канал: {channel_id}
-📝 Тип: {media_type}
-⏰ Время: {scheduled_time.strftime('%Y.%m.%d %H:%M')}
-
-Текст:
-{text[:200]}...
-
-✅ **Подтвердить публикацию?**
-        """
-        
-        keyboard = [
+        keyboard = create_keyboard([
             [
-                InlineKeyboardButton("✅ Да, опубликовать", callback_data="confirm_yes"),
-                InlineKeyboardButton("❌ Нет, отменить", callback_data="confirm_no")
+                {'text': '✅ Да, запланировать', 'callback': 'confirm_post'},
+                {'text': '❌ Нет, отменить', 'callback': 'cancel'}
             ]
-        ]
+        ])
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(confirm_text, reply_markup=reply_markup)
-        
-        return CONFIRM_POST
-        
+        await update.message.reply_text(
+            f"📋 **Подтверждение публикации**\n\n"
+            f"📢 Канал: {context.user_data['channel_id']}\n"
+            f"📝 Тип: {context.user_data['content_type']}\n"
+            f"⏰ Время: {scheduled_time.strftime('%Y.%m.%d %H:%M')}\n\n"
+            f"✅ **Подтвердить публикацию?**",
+            reply_markup=keyboard
+        )
     except ValueError:
         await update.message.reply_text(
             "❌ Неверный формат!\n"
-            "Используйте: YYYY.MM.DD HH:MM\n"
+            "Используйте: ГГГГ.ММ.ДД ЧЧ:ММ\n"
             "Пример: 2025.12.31 18:30\n\n"
             "Попробуйте снова или отправьте ❌ для отмены."
         )
-        return SELECT_TIME
 
-async def confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждение и сохранение поста"""
+async def confirm_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждение поста"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == "confirm_no":
+    if query.data == 'cancel':
         await query.edit_message_text("❌ Планирование отменено.")
-        return ConversationHandler.END
+        return
     
-    # Сохраняем пост в БД
     user_id = update.effective_user.id
-    channel_id = context.user_data['channel_id']
-    content_type = context.user_data['content_type']
-    text = context.user_data['text']
-    media_id = context.user_data['media_id']
-    scheduled_time = context.user_data['scheduled_time']
     
+    # Сохраняем пост
     post_id = await db.add_scheduled_post(
-        user_id, channel_id, content_type, text, media_id, scheduled_time
+        user_id=user_id,
+        channel_id=context.user_data['channel_id'],
+        content_type=context.user_data['content_type'],
+        content=context.user_data['text'],
+        media_id=context.user_data['media_id'],
+        scheduled_time=context.user_data['scheduled_time']
     )
     
-    await db.increment_post_count(user_id)
+    # Обновляем счетчик постов
+    conn = await db.connect()
+    today = datetime.now().date().isoformat()
+    await conn.execute('''
+        UPDATE users 
+        SET posts_today = CASE 
+            WHEN last_post_date = date(?) THEN posts_today + 1 
+            ELSE 1 
+        END,
+        last_post_date = date(?)
+        WHERE user_id = ?
+    ''', (today, today, user_id))
+    await conn.commit()
     
     await query.edit_message_text(
         f"✅ **Пост запланирован!**\n\n"
         f"📝 ID поста: {post_id}\n"
-        f"⏰ Время: {scheduled_time.strftime('%Y.%m.%d %H:%M')}\n"
-        f"📢 Канал: {channel_id}\n\n"
-        f"Пост будет опубликован автоматически в указанное время."
+        f"⏰ Время публикации: {context.user_data['scheduled_time'].strftime('%Y.%m.%d %H:%M')}\n"
+        f"📢 Канал: {context.user_data['channel_id']}\n\n"
+        f"✨ Пост будет опубликован автоматически."
     )
-    
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена диалога"""
-    await update.message.reply_text("❌ Операция отменена.")
-    return ConversationHandler.END
 
 # ========== АДМИН КОМАНДЫ ==========
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Админ панель"""
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /admin"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ Доступ запрещен.")
         return
     
     stats = await db.get_statistics()
+    tariff = await db.get_tariff_info('basic')
     
     text = f"""
 🔧 **Админ панель**
 
 👥 Пользователей: {stats['total_users']}
 💰 Прибыль: {stats['total_revenue']} звезд
-📅 Ожидающих постов: {stats['pending_posts']}
 
 📊 **По тарифам:**
 Free: {stats['tariff_stats'].get('free', 0)}
 Basic: {stats['tariff_stats'].get('basic', 0)}
-Premium: {stats['tariff_stats'].get('premium', 0)}
-VIP: {stats['tariff_stats'].get('vip', 0)}
+
+💵 **Текущий тариф Basic:**
+Цена: {tariff['price']} звезд
+Каналов: {tariff['channels_limit']}
+Постов/день: {tariff['posts_per_day']}
     """
     
-    keyboard = [
-        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("👥 Все пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton("💰 Изменить цены", callback_data="admin_prices")],
-        [InlineKeyboardButton("📢 Настройка каналов", callback_data="admin_channels")],
-        [InlineKeyboardButton("📁 Экспорт данных", callback_data="admin_export")]
-    ]
+    keyboard = create_keyboard([
+        [{'text': '💰 Изменить цену', 'callback': 'admin_set_price'}],
+        [{'text': '🔗 Настроить канал', 'callback': 'admin_set_channel'}],
+        [{'text': '📊 Статистика', 'callback': 'admin_stats'}],
+        [{'text': '👥 Все пользователи', 'callback': 'admin_users'}]
+    ])
     
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(text, reply_markup=reply_markup)
+    await update.message.reply_text(text, reply_markup=keyboard)
 
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка админ колбэков"""
+async def admin_set_price_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройка цены"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == "admin_stats":
-        stats = await db.get_statistics()
-        
+    tariff = await db.get_tariff_info('basic')
+    
+    await query.edit_message_text(
+        f"💰 **Настройка цены тарифа**\n\n"
+        f"Текущая цена: {tariff['price']} звезд\n\n"
+        f"📝 **Введите новую цену:**\n"
+        f"Пример: 150\n\n"
+        f"Или отправьте ❌ для отмены."
+    )
+
+async def admin_set_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройка приватного канала"""
+    query = update.callback_query
+    await query.answer()
+    
+    private_channel = await db.get_private_channel('basic')
+    
+    if private_channel:
         text = f"""
+🔗 **Настройка приватного канала**
+
+Текущий канал:
+ID: {private_channel['channel_id']}
+Ссылка: {private_channel['invite_link']}
+
+📝 **Введите ID канала и ссылку:**
+ID_канала ссылка
+
+Пример:
+-1001234567890 https://t.me/+abc123def456
+
+Или отправьте ❌ для отмены.
+"""
+    else:
+        text = """
+🔗 **Настройка приватного канала**
+
+Приватный канал не настроен.
+
+📝 **Введите ID канала и ссылку:**
+ID_канала ссылка
+
+Пример:
+-1001234567890 https://t.me/+abc123def456
+
+Или отправьте ❌ для отмены.
+"""
+    
+    await query.edit_message_text(text)
+
+async def handle_admin_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка новой цены"""
+    if update.message.text == '❌':
+        await update.message.reply_text("❌ Отменено.")
+        return
+    
+    try:
+        new_price = int(update.message.text)
+        if new_price <= 0:
+            raise ValueError
+        
+        await db.update_tariff_price('basic', new_price)
+        await update.message.reply_text(f"✅ Цена тарифа обновлена: {new_price} звезд")
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверная цена!\n"
+            "Введите положительное число.\n"
+            "Пример: 150"
+        )
+
+async def handle_admin_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка данных канала"""
+    if update.message.text == '❌':
+        await update.message.reply_text("❌ Отменено.")
+        return
+    
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "❌ Неверный формат!\n"
+            "Введите: ID_канала ссылка\n"
+            "Пример: -1001234567890 https://t.me/+abc123def456"
+        )
+        return
+    
+    channel_id = parts[0]
+    invite_link = parts[1]
+    
+    await db.set_private_channel('basic', channel_id, invite_link)
+    await update.message.reply_text(
+        f"✅ Приватный канал настроен!\n\n"
+        f"📢 ID: {channel_id}\n"
+        f"🔗 Ссылка: {invite_link}"
+    )
+
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
+    query = update.callback_query
+    await query.answer()
+    
+    stats = await db.get_statistics()
+    
+    text = f"""
 📊 **Подробная статистика**
 
 👥 Всего пользователей: {stats['total_users']}
 💰 Общая прибыль: {stats['total_revenue']} звезд
-📅 Ожидающих постов: {stats['pending_posts']}
 
 📈 **Распределение по тарифам:**
 Free: {stats['tariff_stats'].get('free', 0)}
 Basic: {stats['tariff_stats'].get('basic', 0)}
-Premium: {stats['tariff_stats'].get('premium', 0)}
-VIP: {stats['tariff_stats'].get('vip', 0)}
-        """
-        
-        await query.edit_message_text(text)
-        
-    elif query.data == "admin_users":
-        users = await db.get_all_users(limit=50)
-        
-        text = "👥 **Последние 50 пользователей:**\n\n"
-        for user in users[:20]:  # Показываем первые 20
-            text += f"👤 {user['first_name']} (@{user['username'] or 'нет'})\n"
-            text += f"   ID: {user['user_id']}\n"
-            text += f"   Тариф: {user['tariff']}\n"
-            text += f"   Каналов: {user['channels_count']}\n"
-            text += f"   Регистрация: {user['registered_at'][:10]}\n\n"
-        
-        if len(users) > 20:
-            text += f"\n... и еще {len(users) - 20} пользователей"
-        
-        await query.edit_message_text(text)
-        
-    elif query.data == "admin_export":
-        csv_data = await db.export_users_csv()
-        
-        # Сохраняем во временный файл
-        filename = f"users_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(csv_data)
-        
-        # Отправляем файл
-        with open(filename, 'rb') as f:
-            await query.message.reply_document(
-                document=f,
-                filename=filename,
-                caption="📁 Экспорт пользователей в CSV"
-            )
-        
-        # Удаляем временный файл
-        import os
-        os.remove(filename)
-        
-        await query.edit_message_text("✅ Данные экспортированы!")
+    """
+    
+    await query.edit_message_text(text)
 
-async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Установка цены тарифа"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Доступ запрещен.")
-        return
-    
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Использование: /set_price [тариф] [цена]\n"
-            "Пример: /set_price basic 299"
-        )
-        return
-    
-    tariff_name = context.args[0].lower()
-    try:
-        price = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Цена должна быть числом!")
-        return
-    
-    success = await db.update_tariff_price(tariff_name, price)
-    
-    if success:
-        await update.message.reply_text(f"✅ Цена тарифа {tariff_name} установлена: {price} звезд")
-    else:
-        await update.message.reply_text(f"❌ Тариф {tariff_name} не найден!")
-
-async def set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Настройка приватного канала для тарифа"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Доступ запрещен.")
-        return
-    
-    if len(context.args) < 3:
-        await update.message.reply_text(
-            "❌ Использование: /set_channel [тариф] [id_канала] [ссылка]\n"
-            "Пример: /set_channel basic -1001234567890 https://t.me/+abc123"
-        )
-        return
-    
-    tariff_name = context.args[0].lower()
-    channel_id = context.args[1]
-    invite_link = context.args[2]
-    
-    success = await db.add_private_channel(tariff_name, channel_id, invite_link)
-    
-    if success:
-        await update.message.reply_text(
-            f"✅ Приватный канал для тарифа {tariff_name} настроен!\n"
-            f"ID: {channel_id}\n"
-            f"Ссылка: {invite_link}"
-        )
-    else:
-        await update.message.reply_text(f"❌ Ошибка настройки канала!")
-
-async def check_expired(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка истекших подписок"""
-    if update.effective_user.id != ADMIN_ID:
-        return
+async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пользователи"""
+    query = update.callback_query
+    await query.answer()
     
     users = await db.get_all_users()
-    expired_users = []
     
-    for user in users:
-        if user['tariff'] != 'free' and user['subscript_end']:
-            end_date = datetime.fromisoformat(user['subscript_end'])
-            if end_date < datetime.now():
-                expired_users.append(user['user_id'])
+    if not users:
+        await query.edit_message_text("📭 Пользователей нет.")
+        return
     
-    if expired_users:
-        for user_id in expired_users:
-            # Снимаем пользователя с тарифа
-            await db.update_user_tariff(user_id, 'free')
-            
-            # Пытаемся кикнуть из приватного канала
-            user_data = await db.get_user(user_id)
-            if user_data:
-                private_channel = await db.get_private_channel(user_data['tariff'])
-                if private_channel:
-                    try:
-                        await context.bot.ban_chat_member(
-                            private_channel['channel_id'],
-                            user_id
-                        )
-                        await context.bot.unban_chat_member(
-                            private_channel['channel_id'],
-                            user_id
-                        )
-                    except:
-                        pass
-        
-        await update.message.reply_text(
-            f"✅ Проверка завершена!\n"
-            f"Истекшие подписки: {len(expired_users)}\n"
-            f"ID пользователей: {', '.join(map(str, expired_users[:10]))}"
-            f"{'...' if len(expired_users) > 10 else ''}"
-        )
-    else:
-        await update.message.reply_text("✅ Истекших подписок нет!")
+    text = "👥 **Последние пользователи:**\n\n"
+    for user in users[:10]:  # Показываем первых 10
+        text += f"👤 {user['first_name']} (@{user['username'] or 'нет'})\n"
+        text += f"   ID: {user['user_id']}\n"
+        text += f"   Тариф: {user['tariff']}\n"
+        text += f"   Каналов: {user['channels_count']}\n"
+        text += f"   Регистрация: {user['registered_at'][:10]}\n\n"
+    
+    if len(users) > 10:
+        text += f"\n... и еще {len(users) - 10} пользователей"
+    
+    await query.edit_message_text(text)
 
-# ========== ФУНКЦИЯ ПУБЛИКАЦИИ ПОСТОВ ==========
-async def publish_posts(context: ContextTypes.DEFAULT_TYPE):
+# ========== ПУБЛИКАЦИЯ ПОСТОВ ==========
+async def publish_scheduled_posts(context: ContextTypes.DEFAULT_TYPE):
     """Публикация запланированных постов"""
     posts = await db.get_pending_posts()
     
     for post in posts:
         try:
-            channel_id = post['channel_id']
-            text = post['content']
-            media_id = post['media_id']
-            content_type = post['content_type']
-            
-            if content_type == 'photo':
+            if post['content_type'] == 'photo':
                 await context.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=media_id,
-                    caption=text
+                    chat_id=post['channel_id'],
+                    photo=post['media_id'],
+                    caption=post['content']
                 )
-            elif content_type == 'video':
+            elif post['content_type'] == 'video':
                 await context.bot.send_video(
-                    chat_id=channel_id,
-                    video=media_id,
-                    caption=text
+                    chat_id=post['channel_id'],
+                    video=post['media_id'],
+                    caption=post['content']
                 )
             else:
                 await context.bot.send_message(
-                    chat_id=channel_id,
-                    text=text
+                    chat_id=post['channel_id'],
+                    text=post['content']
                 )
             
             await db.update_post_status(post['id'], 'published')
+            logger.info(f"Опубликован пост {post['id']} в канале {post['channel_id']}")
             
         except Exception as e:
             logger.error(f"Ошибка публикации поста {post['id']}: {e}")
             await db.update_post_status(post['id'], 'failed')
 
-# ========== КОЛБЭК ОБРАБОТЧИКИ ==========
+# ========== ОБРАБОТЧИК КНОПОК ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нажатий кнопок"""
     query = update.callback_query
     await query.answer()
     
-    if query.data == "plan_post":
-        await plan_post(update, context)
-    elif query.data == "my_channels":
-        await my_channels(update, context)
-    elif query.data == "tariffs":
-        await tariffs(update, context)
-    elif query.data == "help":
+    data = query.data
+    
+    if data == 'main_menu':
+        await start(update, context)
+    elif data == 'plan_post':
+        await plan_post_start(update, context)
+    elif data == 'my_channels':
+        await my_channels_command(update, context)
+    elif data == 'tariffs':
+        await tariffs_command(update, context)
+    elif data == 'help':
         await query.edit_message_text(
-            "🆘 **Помощь по боту**\n\n"
+            "🆘 **Помощь**\n\n"
             "📋 **Основные команды:**\n"
-            "/start - Запуск бота\n"
-            "/plan - Запланировать публикацию\n"
+            "/start - Главное меню\n"
             "/add_channel - Добавить канал\n"
-            "/my_channels - Мои каналы\n"
-            "/tariffs - Тарифы\n"
-            "/pay - Оплатить тариф\n\n"
+            "/channels - Мои каналы\n"
+            "/tariffs - Информация о тарифе\n"
+            "/buy - Купить тариф\n\n"
+            "📅 **Планирование постов:**\n"
+            "1. Нажмите 'Запланировать пост'\n"
+            "2. Выберите канал\n"
+            "3. Отправьте контент\n"
+            "4. Выберите время\n"
+            "5. Подтвердите\n\n"
             "👨‍💼 **Админ команды:**\n"
-            "/admin - Панель администратора\n"
-            "/set_price - Изменить цену\n"
-            "/set_channel - Настроить канал\n"
-            "/check_expired - Проверить подписки\n\n"
+            "/admin - Панель администратора\n\n"
             "📞 **Поддержка:** @ваш_username"
         )
-    elif query.data.startswith("buy_"):
-        tariff = query.data.split("_")[1]
-        await query.edit_message_text(
-            f"Для покупки тарифа {tariff.upper()} используйте команду:\n"
-            f"/pay {tariff}\n\n"
-            "Бот пришлет инструкции по оплате."
-        )
+    elif data == 'buy_tariff':
+        await buy_tariff(update, context)
+    elif data.startswith('select_channel_'):
+        await select_channel_callback(update, context)
+    elif data in ['time_1h', 'time_3h', 'time_tomorrow_9', 'time_tomorrow_18', 'time_now', 'time_custom', 'cancel']:
+        await select_time_callback(update, context)
+    elif data in ['confirm_post', 'confirm_payment']:
+        await confirm_post_callback(update, context)
+    elif data == 'admin_set_price':
+        await admin_set_price_callback(update, context)
+    elif data == 'admin_set_channel':
+        await admin_set_channel_callback(update, context)
+    elif data == 'admin_stats':
+        await admin_stats_callback(update, context)
+    elif data == 'admin_users':
+        await admin_users_callback(update, context)
 
-# ========== ОСНОВНАЯ ФУНКЦИЯ ==========
+# ========== ГЛАВНАЯ ФУНКЦИЯ ==========
 async def main():
-    """Основная функция запуска бота"""
-    # Инициализация базы данных
+    """Запуск бота"""
+    # Инициализируем базу данных
     await db.init_db()
     
-    # Создание приложения
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Создаем Application с настройками для Railway
+    request = HTTPXRequest(connection_pool_size=50)
     
-    # Добавление обработчиков команд
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("tariffs", tariffs))
-    application.add_handler(CommandHandler("pay", pay))
-    application.add_handler(CommandHandler("add_channel", add_channel))
-    application.add_handler(CommandHandler("my_channels", my_channels))
-    
-    # Админ команды
-    application.add_handler(CommandHandler("admin", admin))
-    application.add_handler(CommandHandler("set_price", set_price))
-    application.add_handler(CommandHandler("set_channel", set_channel))
-    application.add_handler(CommandHandler("check_expired", check_expired))
-    
-    # Обработчик планирования постов (ConversationHandler)
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("plan", plan_post)],
-        states={
-            SELECT_CHANNEL: [CallbackQueryHandler(select_channel)],
-            SELECT_CONTENT: [MessageHandler(filters.TEXT | filters.PHOTO | filters.VIDEO, select_content)],
-            SELECT_TIME: [
-                CallbackQueryHandler(select_time),
-                MessageHandler(filters.TEXT, custom_time)
-            ],
-            CONFIRM_POST: [CallbackQueryHandler(confirm_post)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .concurrent_updates(True)  # Включаем параллельную обработку
+        .build()
     )
-    application.add_handler(conv_handler)
+    
+    # Добавляем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("tariffs", tariffs_command))
+    application.add_handler(CommandHandler("add_channel", add_channel_command))
+    application.add_handler(CommandHandler("channels", my_channels_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("buy", buy_tariff))
+    
+    # Обработчик контента поста
+    application.add_handler(MessageHandler(
+        filters.TEXT | filters.PHOTO | filters.VIDEO,
+        handle_post_content
+    ))
+    
+    # Обработчики админских сообщений
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.User(user_id=ADMIN_ID),
+        handle_admin_price,
+        pattern=r'^\d+$'
+    ))
+    
+    application.add_handler(MessageHandler(
+        filters.TEXT & filters.User(user_id=ADMIN_ID),
+        handle_admin_channel,
+        pattern=r'^-100\d+ .+'
+    ))
+    
+    # Обработчик пользовательского времени
+    application.add_handler(MessageHandler(
+        filters.Regex(r'^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}$'),
+        handle_custom_time
+    ))
     
     # Обработчик кнопок
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Периодическая задача для публикации постов
     job_queue = application.job_queue
-    job_queue.run_repeating(publish_posts, interval=60, first=10)  # Каждую минуту
+    job_queue.run_repeating(publish_scheduled_posts, interval=60, first=10)
     
-    # Периодическая проверка подписок (каждые 6 часов)
-    async def check_subscriptions_job(context: ContextTypes.DEFAULT_TYPE):
-        users = await db.get_all_users()
-        for user in users:
-            if user['tariff'] != 'free' and user['subscript_end']:
-                end_date = datetime.fromisoformat(user['subscript_end'])
-                if end_date < datetime.now():
-                    # Тариф истек
-                    await db.update_user_tariff(user['user_id'], 'free')
-    
-    job_queue.run_repeating(check_subscriptions_job, interval=21600, first=300)  # Каждые 6 часов
-    
-    # Запуск бота
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    # Бесконечный цикл
-    await asyncio.Event().wait()
+    # Запускаем бота
+    if WEBHOOK_URL:
+        # Используем webhook на Railway
+        await application.initialize()
+        await application.bot.set_webhook(WEBHOOK_URL)
+        await application.start()
+        
+        # Создаем простой сервер для Railway
+        from aiohttp import web
+        
+        async def handle_webhook(request):
+            """Обработка webhook запросов"""
+            if request.method == "POST":
+                data = await request.json()
+                update = Update.de_json(data, application.bot)
+                await application.process_update(update)
+            return web.Response(text="OK")
+        
+        app = web.Application()
+        app.router.add_post("/webhook", handle_webhook)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        
+        logger.info(f"Бот запущен на Railway с webhook: {WEBHOOK_URL}")
+        
+        # Бесконечный цикл
+        await asyncio.Event().wait()
+    else:
+        # Используем polling для локального запуска
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        
+        logger.info("Бот запущен с polling")
+        
+        # Бесконечный цикл
+        await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
