@@ -30,7 +30,7 @@ from telegram.ext import (
 )
 
 # ========== КОНСТАНТЫ И КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "7370973281:AAGdnM2SdekWwSF5alb5vnt0UWAN5QZ1dCQ"
+BOT_TOKEN = "8569312600:AAGiuvWLi2n84SYahF_pyye94xFqKgNl2IU"
 ADMIN_ID = 6646433980
 
 # Состояния для ConversationHandler
